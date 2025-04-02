@@ -224,3 +224,338 @@ class LLMAgent(nn.Module):
             return action, probs.log_prob(action), probs.entropy(), self.get_value(prompt)
         else:
             return action, probs.log_prob(action), probs.entropy(), None
+
+
+        # TODO: Decouple and rewrite this.
+        def obs2text(self, obs):
+            if self.task == 3:
+                obs = obs.tolist()
+                action_list = [
+                    "pick up the tomato",
+                    "pick up the lettuce",
+                    "pick up the onion",
+                    "take the empty bowl",
+                    "walk to the first cutting board",
+                    "walk to the second cutting board",
+                    "serve nothing",
+                    "chop nothing",
+                ]
+
+                ingredient_in_ori_pos = [0, 0, 0, 0]
+                ingredient = ["a tomato", "a lettuce", "an onion", "a bowl"]
+                raw_ingredient = ["tomato", "lettuce", "onion", "bowl"]
+                chopped = [False, False, False]
+                ori_pos = [[0, 5], [1, 6], [2, 6], [6, 5]]
+                sentences = ["There are two fixed cutting boards in the room."]
+
+                item = []
+                item_index = []
+                agent_pos = obs[17:19]
+                first_cutting_board_pos = [1, 0]
+                second_cutting_board_pos = [2, 0]
+
+                item_pos = {"in_agent": agent_pos, "in_first_cutting_board": first_cutting_board_pos,
+                            "in_second_cutting_board": second_cutting_board_pos}
+                overlay = {"in_agent": [], "in_first_cutting_board": [], "in_second_cutting_board": []}
+
+                for i in range(4):
+                    pos = obs[3 * i: 3 * i + 2]
+                    if pos == ori_pos[i]:
+                        ingredient_in_ori_pos[i] == 1
+                        item.append(ingredient[i])
+                        item_index.append(i)
+
+                    if i < 3 and obs[3 * i + 2] == 3:
+                        chopped[i] = True
+
+                    for k in overlay.keys():
+                        if pos == item_pos[k]:
+                            overlay[k].append(i)
+
+                            if len(overlay[k]) > 1:
+                                action_list[3] = "take the bowl"
+
+                if len(item) == 1:
+                    template = "You notice {} on the table."
+                elif len(item) == 2:
+                    template = "You notice {} and {} on the different tables."
+                elif len(item) == 3:
+                    template = "You notice {}, {} and {} on the different tables."
+                elif len(item) == 4:
+                    template = "You notice {}, {}, {} and {} on the different tables."
+
+                if len(item) > 0:
+                    sentences.append(template.format(*item).capitalize())
+
+                cutting_board_index = ["first", "second"]
+                cutting_board_name = ["in_first_cutting_board", "in_second_cutting_board"]
+                for cindex in range(2):
+                    if len(overlay[cutting_board_name[cindex]]) == 1:
+                        id = overlay[cutting_board_name[cindex]][0]
+                        template = "{} is on the {} cutting board."
+                        if id == 3:
+                            sentences.append(template.format("a bowl", cutting_board_index[cindex]).capitalize())
+                        else:
+                            if chopped[id]:
+                                sentences.append(template.format("a chopped " + raw_ingredient[id],
+                                                                 cutting_board_index[cindex]).capitalize())
+                            else:
+                                sentences.append(template.format("an unchopped " + raw_ingredient[id],
+                                                                 cutting_board_index[cindex]).capitalize())
+                            if agent_pos == [cindex + 1, 1]:
+                                action_list[-1] = "chop the " + raw_ingredient[id]
+
+                    elif len(overlay[cutting_board_name[cindex]]) > 1:
+                        in_plate_item = overlay[cutting_board_name[cindex]][:-1]
+                        if len(in_plate_item) == 1:
+                            full_plate_template = "A bowl containing chopped {} is on the {} cutting board."
+                        elif len(in_plate_item) == 2:
+                            full_plate_template = "A bowl containing chopped {} and {} is on the {} cutting board."
+                        elif len(in_plate_item) == 3:
+                            full_plate_template = "A bowl containing chopped {}, {} and {} is on the {} cutting board."
+                        sentences.append(full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item],
+                                                                    cutting_board_index[cindex]).capitalize())
+
+                        # in front of cutting board 1
+                if agent_pos == [1, 1]:
+                    cindex = 0
+                # in front of cutting board 2
+                elif agent_pos == [2, 1]:
+                    cindex = 1
+                else:
+                    cindex = -1
+
+                action_template = "put the {} on the {} cutting board"
+                hold_bowl_action = [
+                    "put the tomato in the bowl",
+                    "put the lettuce in the bowl",
+                    "put the onion in the bowl",
+                ]
+
+                if cindex >= 0:
+                    if len(overlay["in_agent"]) == 0:
+                        template = "Currently you are standing in front of the {} cutting board without anything in hand."
+                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+
+                    elif len(overlay["in_agent"]) == 1:
+                        action_list[6] = "serve the dish"
+                        id = overlay["in_agent"][0]
+                        template = "Currently you are standing in front of the {} cutting board, carrying {} in hand."
+                        if id == 3:
+                            sentences.append(template.format(cutting_board_index[cindex], "a bowl").capitalize())
+                            action_list[:3] = hold_bowl_action
+                            action_list[4] = action_template.format(raw_ingredient[id], "first")
+                            action_list[5] = action_template.format(raw_ingredient[id], "second")
+                        else:
+                            if chopped[id]:
+                                sentences.append(template.format(cutting_board_index[cindex],
+                                                                 "a chopped " + raw_ingredient[id], ).capitalize())
+                            else:
+                                sentences.append(template.format(cutting_board_index[cindex],
+                                                                 "an unchopped " + raw_ingredient[id]).capitalize())
+                                action_list[4] = action_template.format(raw_ingredient[id], "first")
+                                action_list[5] = action_template.format(raw_ingredient[id], "second")
+                    elif len(overlay["in_agent"]) > 1:
+                        action_list[6] = "serve the dish"
+                        in_plate_item = overlay["in_agent"][:-1]
+                        if len(in_plate_item) == 1:
+                            full_plate_template = "Currently you are standing in front of the {} cutting board, carrying a bowl containing chopped {} in hand."
+                        elif len(in_plate_item) == 2:
+                            full_plate_template = "Currently you are standing in front of the {} cutting board, carrying a bowl containing chopped {} and {} in hand."
+                        elif len(in_plate_item) == 3:
+                            full_plate_template = "Currently you are standing in front of the {} cutting board, carrying a bowl containing chopped {}, {} and {} in hand."
+
+                        sentences.append(full_plate_template.format(cutting_board_index[cindex],
+                                                                    *[raw_ingredient[id] for id in
+                                                                      in_plate_item]).capitalize())
+                        action_list[:3] = hold_bowl_action
+                        action_list[4] = action_template.format("bowl", "first")
+                        action_list[5] = action_template.format("bowl", "second")
+                else:
+                    if len(overlay["in_agent"]) == 0:
+                        template = "Currently you don't have anything in hand."
+                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+
+                    elif len(overlay["in_agent"]) == 1:
+                        action_list[6] = "serve the dish"
+                        id = overlay["in_agent"][0]
+                        template = "Currently you are carrying {} in hand."
+                        if id == 3:
+                            sentences.append(template.format("a bowl").capitalize())
+                            action_list[:3] = hold_bowl_action
+                            action_list[4] = action_template.format(raw_ingredient[id], "first")
+                            action_list[5] = action_template.format(raw_ingredient[id], "second")
+                        else:
+                            if chopped[id]:
+                                sentences.append(template.format("a chopped " + raw_ingredient[id], ).capitalize())
+                            else:
+                                sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
+                                action_list[4] = action_template.format(raw_ingredient[id], "first")
+                                action_list[5] = action_template.format(raw_ingredient[id], "second")
+                    elif len(overlay["in_agent"]) > 1:
+                        action_list[6] = "serve the dish"
+                        in_plate_item = overlay["in_agent"][:-1]
+                        if len(in_plate_item) == 1:
+                            full_plate_template = "Currently you are carrying a bowl containing chopped {}."
+                        elif len(in_plate_item) == 2:
+                            full_plate_template = "Currently you are carrying a bowl containing chopped {} and {}."
+                        elif len(in_plate_item) == 3:
+                            full_plate_template = "Currently you are carrying a bowl containing chopped {}, {} and {}."
+
+                        sentences.append(
+                            full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item]).capitalize())
+                        action_list[:3] = hold_bowl_action
+                        action_list[4] = action_template.format("bowl", "first")
+                        action_list[5] = action_template.format("bowl", "second")
+                sentences.append(
+                    "To serve the dish of a bowl only containing chopped tomato and lettuce, you should first")
+            elif self.task == 0:
+                obs = obs.tolist()
+
+                action_list = [
+                    "pick up the tomato",
+                    "take the bowl",
+                    "walk to the cutting board",
+                    "serve nothing",
+                    "chop nothing",
+                ]
+
+                ingredient_in_ori_pos = [0, 0]
+                ingredient = ["a tomato", "a bowl"]
+                raw_ingredient = ["tomato", "bowl"]
+                chopped = [False]
+                ori_pos = [[0, 5], [6, 5]]
+                sentences = ["There is a fixed cutting board in the room."]
+                in_plate = [False, False, False]
+
+                item = []
+                item_index = []
+                plate_pos = obs[3:5]
+                agent_pos = obs[9:11]
+                first_cutting_board_pos = [1, 0]
+
+                item_pos = {"in_agent": agent_pos, "in_first_cutting_board": first_cutting_board_pos}
+                overlay = {"in_agent": [], "in_first_cutting_board": []}
+
+                for i in range(2):
+                    pos = obs[3 * i: 3 * i + 2]
+                    if pos == ori_pos[i]:
+                        ingredient_in_ori_pos[i] == 1
+                        item.append(ingredient[i])
+                        item_index.append(i)
+
+                    if i < 1 and obs[3 * i + 2] == 3:
+                        chopped[i] = True
+
+                    for k in overlay.keys():
+                        if pos == item_pos[k]:
+                            overlay[k].append(i)
+                if len(item) == 1:
+                    template = "You notice {} on the table."
+                elif len(item) == 2:
+                    template = "You notice {} and {} on the different tables."
+
+                if len(item) > 0:
+                    sentences.append(template.format(*item).capitalize())
+
+                cutting_board_index = ["first"]
+                cutting_board_name = ["in_first_cutting_board"]
+
+                cindex = 0
+                if len(overlay[cutting_board_name[cindex]]) == 1:
+                    id = overlay[cutting_board_name[cindex]][0]
+                    template = "{} is on the cutting board."
+                    if id == 1:
+                        sentences.append(template.format("a bowl").capitalize())
+                    else:
+                        if chopped[id]:
+                            sentences.append(template.format("a chopped " + raw_ingredient[id]).capitalize())
+                        else:
+                            sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
+                        if agent_pos == [cindex + 1, 1]:
+                            action_list[-1] = "chop the " + raw_ingredient[id]
+
+
+                elif len(overlay[cutting_board_name[cindex]]) > 1:
+
+                    full_plate_template = "a bowl containing a chopped tomato is on the cutting board."
+                    sentences.append(full_plate_template.capitalize())
+
+                    # in front of cutting board 1
+                if agent_pos == [1, 1]:
+                    cindex = 0
+                # in front of cutting board 2
+                elif agent_pos == [2, 1]:
+                    cindex = 1
+                else:
+                    cindex = -1
+
+                action_template = "put the {} on the cutting board"
+                hold_bowl_action = [
+                    "put the tomato in the bowl",
+                ]
+
+                if cindex >= 0:
+                    if len(overlay["in_agent"]) == 0:
+                        template = "Currently you are standing in front of the cutting board without anything in hand."
+                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+
+                    elif len(overlay["in_agent"]) == 1:
+                        id = overlay["in_agent"][0]
+                        action_list[3] = "serve the dish"
+                        template = "Currently you are standing in front of the cutting board, carrying {} in hand."
+                        if id == 1:
+                            sentences.append(template.format("a bowl").capitalize())
+                            action_list[0] = hold_bowl_action[0]
+                            action_list[2] = action_template.format(raw_ingredient[id])
+                        else:
+                            if chopped[id]:
+                                sentences.append(template.format("a chopped " + raw_ingredient[id]).capitalize())
+                            else:
+                                sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
+                                action_list[2] = action_template.format(raw_ingredient[id])
+                    elif len(overlay["in_agent"]) > 1:
+                        action_list[3] = "serve the dish"
+                        in_plate_item = overlay["in_agent"][:-1]
+                        if len(in_plate_item) == 1:
+                            full_plate_template = "Currently you are standing in front of the cutting board, carrying a bowl containing chopped {} in hand."
+                        sentences.append(
+                            full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item]).capitalize())
+                        action_list[0] = hold_bowl_action[0]
+                        action_list[2] = action_template.format("bowl")
+                else:
+                    if len(overlay["in_agent"]) == 0:
+                        template = "Currently you don't have anything in hand."
+                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+
+                    elif len(overlay["in_agent"]) == 1:
+                        action_list[3] = "serve the dish"
+                        id = overlay["in_agent"][0]
+                        template = "Currently you are carrying {} in hand."
+                        if id == 1:
+                            sentences.append(template.format("a bowl").capitalize())
+                            action_list[0] = hold_bowl_action[0]
+                            action_list[2] = action_template.format(raw_ingredient[id])
+                        else:
+                            if chopped[id]:
+                                sentences.append(template.format("a chopped " + raw_ingredient[id], ).capitalize())
+                            else:
+                                sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
+                                action_list[2] = action_template.format(raw_ingredient[id])
+                    elif len(overlay["in_agent"]) > 1:
+                        action_list[3] = "serve the dish"
+                        in_plate_item = overlay["in_agent"][:-1]
+                        if len(in_plate_item) == 1:
+                            full_plate_template = "Currently you are carrying a bowl containing chopped {}."
+                        elif len(in_plate_item) == 2:
+                            full_plate_template = "Currently you are carrying a bowl containing chopped {} and {}."
+                        elif len(in_plate_item) == 3:
+                            full_plate_template = "Currently you are carrying a bowl containing chopped {}, {} and {}."
+                        sentences.append(
+                            full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item]).capitalize())
+                        action_list[0] = hold_bowl_action[0]
+                        action_list[2] = action_template.format("bowl")
+
+                sentences.append("To serve the dish of a bowl only containing chopped tomato, you should first")
+
+            return {"prompt": " ".join(sentences), "action": action_list}
