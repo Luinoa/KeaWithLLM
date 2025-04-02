@@ -195,23 +195,6 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
                     break
 
-        # Compute bootstrap value and advantages
-        with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                advantages[t] = lastgaelam
-            returns = advantages + values
-
         experiences = {
             'obs': obs,
             'actions': actions,
