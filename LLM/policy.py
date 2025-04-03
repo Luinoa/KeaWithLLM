@@ -35,17 +35,18 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+
 class LLMAgent(nn.Module):
-    def __init__(self, normalization_mode = 'token', load_path = None, load_8bit = False):
+    def __init__(self, normalization_mode='token', load_path=None, load_8bit=False):
         super().__init__()
 
         self.load_8bit = load_8bit
         self.base_model = 'Neko-Institute-of-Science/LLaMA-7B-HF'
-        self.lora_r  = 8
+        self.lora_r = 8
         self.lora_alpha = 16
-        #self.lora_dropout = 0.05
+        # self.lora_dropout = 0.05
         self.lora_dropout = 0
-        self.lora_target_modules  = ["q_proj", "v_proj",]
+        self.lora_target_modules = ["q_proj", "v_proj", ]
 
         assert (
             self.base_model
@@ -93,7 +94,7 @@ class LLMAgent(nn.Module):
 
         return model
 
-    def _init_actor(self, lora_weights = None):
+    def _init_actor(self, lora_weights=None):
         if lora_weights is None:
             config = LoraConfig(
                 r=self.lora_r,
@@ -130,10 +131,10 @@ class LLMAgent(nn.Module):
 
         return model
 
-    def _init_critic(self, critic_weights = None):
+    def _init_critic(self, critic_weights=None):
         critic = Critic(self.actor, self.tokenizer)
         if critic_weights is not None:
-            critic.v_head.load_state_dict(torch.load(critic_weights, map_location= "cpu"))
+            critic.v_head.load_state_dict(torch.load(critic_weights, map_location="cpu"))
         return critic
 
     def save(self, epoch, exp_path):
@@ -168,10 +169,12 @@ class LLMAgent(nn.Module):
     def get_action_and_value(self, obs, action=None, is_warmup=False, return_value=True):
         text_obs = [self.obs2text(o) for o in obs]
         prompt = [o["prompt"] for o in text_obs]
-        action_list = [o["action"] for o in text_obs]
 
-        prompt_num = len(prompt)
-        action_num = len(action_list[0])
+        action_list = [o["action"] for o in text_obs]
+        action_ids = [[self.template2action[item] for item in env] for env in action_list]
+
+        prompt_nums = len(prompt)
+        action_nums = [len(item) for item in action_list]
 
         sequence = []
         for p, ac in zip(prompt, action_list):
@@ -181,6 +184,7 @@ class LLMAgent(nn.Module):
         input_ids = inputs["input_ids"].to(self.device)
 
         attention_mask = inputs["attention_mask"].to(self.device)
+
         if is_warmup:
             with torch.no_grad():
                 outputs = self.actor(input_ids, attention_mask=attention_mask)
@@ -191,10 +195,10 @@ class LLMAgent(nn.Module):
         self.action_list_ids = self.tokenizer(action_list, return_tensors="pt", padding=True)
 
         self.action_list_length = torch.sum(self.action_list_ids["attention_mask"], dim=-1) - 1  # delete first token
+
         sequence_length = torch.sum(attention_mask, dim=-1)
         action_index = [[end - start, end] for start, end in zip(self.action_list_length, sequence_length)]
 
-        # maybe no need to use it, directly use logits
         logits = torch.log_softmax(outputs.logits, dim=-1)
 
         logits = logits[:, :-1, :]
@@ -204,6 +208,7 @@ class LLMAgent(nn.Module):
         slices = [gen_logits[i, start - 1:end - 1] for i, (start, end) in enumerate(action_index)]
 
         action_logits = torch.stack([torch.sum(s) for s in slices])
+
         if self.normalization_mode == 'token':
             action_logits = action_logits / self.action_list_length.to(self.device)
         elif self.normalization_mode == 'word':
@@ -214,348 +219,576 @@ class LLMAgent(nn.Module):
         else:
             assert 1 == 2
 
-        action_logits = action_logits.reshape(-1, action_num).float()
+        actions = []
+        log_probs = []
+        entroy = []
 
-        probs = Categorical(logits=action_logits)
-        if action is None:
-            action = probs.sample()
+        for i in range(prompt_nums):
+            logits = action_logits[sum(action_nums[:i]):sum(action_nums[:i + 1])].reshape(-1, action_nums[i]).float()
+
+            probs = Categorical(logits=logits)
+
+            if action is None:
+                cur_action = probs.sample()[0]
+                cur_action = cur_action.view(-1)
+                real_action = torch.tensor([action_ids[i][cur_action.item()]], dtype=torch.int32).to(self.device)
+            else:
+                real_action = action[i].view(-1)
+                cur_action = torch.tensor([action_ids[i].index(real_action.item())], dtype=torch.int32).to(self.device)
+
+            actions.append(real_action)
+            log_probs.append(probs.log_prob(cur_action))
+            entroy.append(probs.entropy())
+
+        action = torch.cat(actions)
+        log_probs = torch.cat(log_probs)
+        entroy = torch.cat(entroy)
 
         if return_value:
-            return action, probs.log_prob(action), probs.entropy(), self.get_value(prompt)
+            return action, log_probs, entroy, self.get_value(prompt)
         else:
-            return action, probs.log_prob(action), probs.entropy(), None
+            return action, log_probs, entroy, None
 
+    def obs2text(self, obs):
 
-        # TODO: Decouple and rewrite this.
-        def obs2text(self, obs):
-            if self.task == 3:
-                obs = obs.tolist()
-                action_list = [
-                    "pick up the tomato",
-                    "pick up the lettuce",
-                    "pick up the onion",
-                    "take the empty bowl",
-                    "walk to the first cutting board",
-                    "walk to the second cutting board",
-                    "serve nothing",
-                    "chop nothing",
-                ]
+        text = ""
 
-                ingredient_in_ori_pos = [0, 0, 0, 0]
-                ingredient = ["a tomato", "a lettuce", "an onion", "a bowl"]
-                raw_ingredient = ["tomato", "lettuce", "onion", "bowl"]
-                chopped = [False, False, False]
-                ori_pos = [[0, 5], [1, 6], [2, 6], [6, 5]]
-                sentences = ["There are two fixed cutting boards in the room."]
+        in_kitchen = obs[0]
+        in_bathroom = obs[1]
+        in_bedroom = obs[2]
+        in_livingroom = obs[3]
 
-                item = []
-                item_index = []
-                agent_pos = obs[17:19]
-                first_cutting_board_pos = [1, 0]
-                second_cutting_board_pos = [2, 0]
+        see_chips = obs[4]
+        close_to_chips = obs[5]
+        hold_chips = obs[6]
+        chips_on_coffeetable = obs[7]
 
-                item_pos = {"in_agent": agent_pos, "in_first_cutting_board": first_cutting_board_pos,
-                            "in_second_cutting_board": second_cutting_board_pos}
-                overlay = {"in_agent": [], "in_first_cutting_board": [], "in_second_cutting_board": []}
+        see_milk = obs[8]
+        close_to_milk = obs[9]
+        hold_milk = obs[10]
+        milk_on_coffeetable = obs[11]
 
-                for i in range(4):
-                    pos = obs[3 * i: 3 * i + 2]
-                    if pos == ori_pos[i]:
-                        ingredient_in_ori_pos[i] == 1
-                        item.append(ingredient[i])
-                        item_index.append(i)
+        see_tv = obs[12]
+        close_to_tv = obs[13]
+        is_face_tv = obs[14]
+        is_tv_on = obs[15]
 
-                    if i < 3 and obs[3 * i + 2] == 3:
-                        chopped[i] = True
+        see_sofa = obs[16]
+        close_to_sofa = obs[17]
+        is_sit_sofa = obs[18]
 
-                    for k in overlay.keys():
-                        if pos == item_pos[k]:
-                            overlay[k].append(i)
+        see_coffeetable = obs[19]
+        close_to_coffeetable = obs[20]
+        assert in_kitchen + in_bathroom + in_bedroom + in_livingroom == 1, "Only one room can be true at a time"
 
-                            if len(overlay[k]) > 1:
-                                action_list[3] = "take the bowl"
+        # template for room
+        in_room_teplate = "There are four rooms: the kitchen, bathroom, bedroom, and living room. You are in the {} "
+        if in_kitchen:
+            text += in_room_teplate.format("kitchen")
+        elif in_bathroom:
+            text += in_room_teplate.format("bathroom")
+        elif in_bedroom:
+            text += in_room_teplate.format("bedroom")
+        elif in_livingroom:
+            text += in_room_teplate.format("living room")
 
-                if len(item) == 1:
-                    template = "You notice {} on the table."
-                elif len(item) == 2:
-                    template = "You notice {} and {} on the different tables."
-                elif len(item) == 3:
-                    template = "You notice {}, {} and {} on the different tables."
-                elif len(item) == 4:
-                    template = "You notice {}, {}, {} and {} on the different tables."
+        ########################################template2####################################
+        # template for kitchen
+        object_text = ""
 
-                if len(item) > 0:
-                    sentences.append(template.format(*item).capitalize())
+        action_list = []
 
-                cutting_board_index = ["first", "second"]
-                cutting_board_name = ["in_first_cutting_board", "in_second_cutting_board"]
-                for cindex in range(2):
-                    if len(overlay[cutting_board_name[cindex]]) == 1:
-                        id = overlay[cutting_board_name[cindex]][0]
-                        template = "{} is on the {} cutting board."
-                        if id == 3:
-                            sentences.append(template.format("a bowl", cutting_board_index[cindex]).capitalize())
-                        else:
-                            if chopped[id]:
-                                sentences.append(template.format("a chopped " + raw_ingredient[id],
-                                                                 cutting_board_index[cindex]).capitalize())
-                            else:
-                                sentences.append(template.format("an unchopped " + raw_ingredient[id],
-                                                                 cutting_board_index[cindex]).capitalize())
-                            if agent_pos == [cindex + 1, 1]:
-                                action_list[-1] = "chop the " + raw_ingredient[id]
+        if in_kitchen:
 
-                    elif len(overlay[cutting_board_name[cindex]]) > 1:
-                        in_plate_item = overlay[cutting_board_name[cindex]][:-1]
-                        if len(in_plate_item) == 1:
-                            full_plate_template = "A bowl containing chopped {} is on the {} cutting board."
-                        elif len(in_plate_item) == 2:
-                            full_plate_template = "A bowl containing chopped {} and {} is on the {} cutting board."
-                        elif len(in_plate_item) == 3:
-                            full_plate_template = "A bowl containing chopped {}, {} and {} is on the {} cutting board."
-                        sentences.append(full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item],
-                                                                    cutting_board_index[cindex]).capitalize())
+            if see_chips and see_milk:
+                object_text += "and notice chips and milk. "
 
-                        # in front of cutting board 1
-                if agent_pos == [1, 1]:
-                    cindex = 0
-                # in front of cutting board 2
-                elif agent_pos == [2, 1]:
-                    cindex = 1
-                else:
-                    cindex = -1
+                if hold_chips and hold_milk:
+                    object_text += "Currently, you have grabbed the chips and the milk in hand. "
 
-                action_template = "put the {} on the {} cutting board"
-                hold_bowl_action = [
-                    "put the tomato in the bowl",
-                    "put the lettuce in the bowl",
-                    "put the onion in the bowl",
-                ]
+                    action_list = [
+                        0,
+                        2,
+                        3,
+                    ]
 
-                if cindex >= 0:
-                    if len(overlay["in_agent"]) == 0:
-                        template = "Currently you are standing in front of the {} cutting board without anything in hand."
-                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+                elif hold_chips and not hold_milk:
+                    if close_to_milk:
+                        object_text += "The milk is close to you. But you have not grabbed the milk. Currently, you have grabbed the chips in hand. "
 
-                    elif len(overlay["in_agent"]) == 1:
-                        action_list[6] = "serve the dish"
-                        id = overlay["in_agent"][0]
-                        template = "Currently you are standing in front of the {} cutting board, carrying {} in hand."
-                        if id == 3:
-                            sentences.append(template.format(cutting_board_index[cindex], "a bowl").capitalize())
-                            action_list[:3] = hold_bowl_action
-                            action_list[4] = action_template.format(raw_ingredient[id], "first")
-                            action_list[5] = action_template.format(raw_ingredient[id], "second")
-                        else:
-                            if chopped[id]:
-                                sentences.append(template.format(cutting_board_index[cindex],
-                                                                 "a chopped " + raw_ingredient[id], ).capitalize())
-                            else:
-                                sentences.append(template.format(cutting_board_index[cindex],
-                                                                 "an unchopped " + raw_ingredient[id]).capitalize())
-                                action_list[4] = action_template.format(raw_ingredient[id], "first")
-                                action_list[5] = action_template.format(raw_ingredient[id], "second")
-                    elif len(overlay["in_agent"]) > 1:
-                        action_list[6] = "serve the dish"
-                        in_plate_item = overlay["in_agent"][:-1]
-                        if len(in_plate_item) == 1:
-                            full_plate_template = "Currently you are standing in front of the {} cutting board, carrying a bowl containing chopped {} in hand."
-                        elif len(in_plate_item) == 2:
-                            full_plate_template = "Currently you are standing in front of the {} cutting board, carrying a bowl containing chopped {} and {} in hand."
-                        elif len(in_plate_item) == 3:
-                            full_plate_template = "Currently you are standing in front of the {} cutting board, carrying a bowl containing chopped {}, {} and {} in hand."
-
-                        sentences.append(full_plate_template.format(cutting_board_index[cindex],
-                                                                    *[raw_ingredient[id] for id in
-                                                                      in_plate_item]).capitalize())
-                        action_list[:3] = hold_bowl_action
-                        action_list[4] = action_template.format("bowl", "first")
-                        action_list[5] = action_template.format("bowl", "second")
-                else:
-                    if len(overlay["in_agent"]) == 0:
-                        template = "Currently you don't have anything in hand."
-                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
-
-                    elif len(overlay["in_agent"]) == 1:
-                        action_list[6] = "serve the dish"
-                        id = overlay["in_agent"][0]
-                        template = "Currently you are carrying {} in hand."
-                        if id == 3:
-                            sentences.append(template.format("a bowl").capitalize())
-                            action_list[:3] = hold_bowl_action
-                            action_list[4] = action_template.format(raw_ingredient[id], "first")
-                            action_list[5] = action_template.format(raw_ingredient[id], "second")
-                        else:
-                            if chopped[id]:
-                                sentences.append(template.format("a chopped " + raw_ingredient[id], ).capitalize())
-                            else:
-                                sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
-                                action_list[4] = action_template.format(raw_ingredient[id], "first")
-                                action_list[5] = action_template.format(raw_ingredient[id], "second")
-                    elif len(overlay["in_agent"]) > 1:
-                        action_list[6] = "serve the dish"
-                        in_plate_item = overlay["in_agent"][:-1]
-                        if len(in_plate_item) == 1:
-                            full_plate_template = "Currently you are carrying a bowl containing chopped {}."
-                        elif len(in_plate_item) == 2:
-                            full_plate_template = "Currently you are carrying a bowl containing chopped {} and {}."
-                        elif len(in_plate_item) == 3:
-                            full_plate_template = "Currently you are carrying a bowl containing chopped {}, {} and {}."
-
-                        sentences.append(
-                            full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item]).capitalize())
-                        action_list[:3] = hold_bowl_action
-                        action_list[4] = action_template.format("bowl", "first")
-                        action_list[5] = action_template.format("bowl", "second")
-                sentences.append(
-                    "To serve the dish of a bowl only containing chopped tomato and lettuce, you should first")
-            elif self.task == 0:
-                obs = obs.tolist()
-
-                action_list = [
-                    "pick up the tomato",
-                    "take the bowl",
-                    "walk to the cutting board",
-                    "serve nothing",
-                    "chop nothing",
-                ]
-
-                ingredient_in_ori_pos = [0, 0]
-                ingredient = ["a tomato", "a bowl"]
-                raw_ingredient = ["tomato", "bowl"]
-                chopped = [False]
-                ori_pos = [[0, 5], [6, 5]]
-                sentences = ["There is a fixed cutting board in the room."]
-                in_plate = [False, False, False]
-
-                item = []
-                item_index = []
-                plate_pos = obs[3:5]
-                agent_pos = obs[9:11]
-                first_cutting_board_pos = [1, 0]
-
-                item_pos = {"in_agent": agent_pos, "in_first_cutting_board": first_cutting_board_pos}
-                overlay = {"in_agent": [], "in_first_cutting_board": []}
-
-                for i in range(2):
-                    pos = obs[3 * i: 3 * i + 2]
-                    if pos == ori_pos[i]:
-                        ingredient_in_ori_pos[i] == 1
-                        item.append(ingredient[i])
-                        item_index.append(i)
-
-                    if i < 1 and obs[3 * i + 2] == 3:
-                        chopped[i] = True
-
-                    for k in overlay.keys():
-                        if pos == item_pos[k]:
-                            overlay[k].append(i)
-                if len(item) == 1:
-                    template = "You notice {} on the table."
-                elif len(item) == 2:
-                    template = "You notice {} and {} on the different tables."
-
-                if len(item) > 0:
-                    sentences.append(template.format(*item).capitalize())
-
-                cutting_board_index = ["first"]
-                cutting_board_name = ["in_first_cutting_board"]
-
-                cindex = 0
-                if len(overlay[cutting_board_name[cindex]]) == 1:
-                    id = overlay[cutting_board_name[cindex]][0]
-                    template = "{} is on the cutting board."
-                    if id == 1:
-                        sentences.append(template.format("a bowl").capitalize())
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            10
+                        ]
                     else:
-                        if chopped[id]:
-                            sentences.append(template.format("a chopped " + raw_ingredient[id]).capitalize())
-                        else:
-                            sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
-                        if agent_pos == [cindex + 1, 1]:
-                            action_list[-1] = "chop the " + raw_ingredient[id]
+                        object_text += "The milk is not close to you. Currently, you have grabbed the chips in hand. "
 
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            5
+                        ]
+                elif not hold_chips and hold_milk:
+                    if close_to_chips:
+                        object_text += "The chips are close to you. But you have not grabbed the chips. Currently, you have grabbed the milk in hand. "
 
-                elif len(overlay[cutting_board_name[cindex]]) > 1:
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            9
+                        ]
+                    else:
+                        object_text += "The chips are not close to you. Currently, you have grabbed the milk in hand. "
 
-                    full_plate_template = "a bowl containing a chopped tomato is on the cutting board."
-                    sentences.append(full_plate_template.capitalize())
-
-                    # in front of cutting board 1
-                if agent_pos == [1, 1]:
-                    cindex = 0
-                # in front of cutting board 2
-                elif agent_pos == [2, 1]:
-                    cindex = 1
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            4
+                        ]
                 else:
-                    cindex = -1
+                    if close_to_chips and close_to_milk:
+                        object_text += "They are close to you. But you have not grabbed the them. "
 
-                action_template = "put the {} on the cutting board"
-                hold_bowl_action = [
-                    "put the tomato in the bowl",
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            9,
+                            10
+                        ]
+
+                    elif close_to_chips and not close_to_milk:
+                        object_text += "The chips are close to you. But you have not grabbed the chips. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            5,
+                            9,
+                        ]
+
+                    elif not close_to_chips and close_to_milk:
+                        object_text += "The milk is close to you. But you have not grabbed the milk. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            4,
+                            10,
+                        ]
+
+                    else:
+                        object_text += "But they are not close to you. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            4,
+                            5,
+                        ]
+
+                    object_text += "Currently, you are not grabbing anything in hand. "
+
+            elif see_chips and not see_milk:
+                object_text += "and only notice chips. "
+
+                if hold_chips:
+                    object_text += "Currently, you have grabbed the chips in hand. "
+
+                    action_list = [
+                        0,
+                        2,
+                        3,
+                    ]
+
+                else:
+                    if close_to_chips:
+                        object_text += "The chips are close to you. But you have not grabbed the chips. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            9,
+                        ]
+                    else:
+                        object_text += "The chips are not close to you. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            5,
+                        ]
+
+            elif not see_chips and see_milk:
+                object_text += "and notice milk. "
+
+                if hold_milk:
+                    object_text += "Currently, you have grabbed the milk in hand. "
+
+                    action_list = [
+                        0,
+                        2,
+                        3,
+                    ]
+
+                else:
+                    if close_to_milk:
+                        object_text += "The milk is close to you. But you have not grabbed the milk. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            10,
+                        ]
+                    else:
+                        object_text += "The milk is not close to you. "
+
+                        action_list = [
+                            0,
+                            2,
+                            3,
+                            4,
+                        ]
+
+            else:
+                object_text += "and notice nothing. "
+
+                action_list = [
+                    0,
+                    2,
+                    3,
                 ]
 
-                if cindex >= 0:
-                    if len(overlay["in_agent"]) == 0:
-                        template = "Currently you are standing in front of the cutting board without anything in hand."
-                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+        elif in_livingroom:
 
-                    elif len(overlay["in_agent"]) == 1:
-                        id = overlay["in_agent"][0]
-                        action_list[3] = "serve the dish"
-                        template = "Currently you are standing in front of the cutting board, carrying {} in hand."
-                        if id == 1:
-                            sentences.append(template.format("a bowl").capitalize())
-                            action_list[0] = hold_bowl_action[0]
-                            action_list[2] = action_template.format(raw_ingredient[id])
-                        else:
-                            if chopped[id]:
-                                sentences.append(template.format("a chopped " + raw_ingredient[id]).capitalize())
-                            else:
-                                sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
-                                action_list[2] = action_template.format(raw_ingredient[id])
-                    elif len(overlay["in_agent"]) > 1:
-                        action_list[3] = "serve the dish"
-                        in_plate_item = overlay["in_agent"][:-1]
-                        if len(in_plate_item) == 1:
-                            full_plate_template = "Currently you are standing in front of the cutting board, carrying a bowl containing chopped {} in hand."
-                        sentences.append(
-                            full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item]).capitalize())
-                        action_list[0] = hold_bowl_action[0]
-                        action_list[2] = action_template.format("bowl")
+            object_text += "and you notice a coffee table, a TV and a sofa. "
+
+            assert close_to_coffeetable + close_to_tv + close_to_sofa <= 1, "You are next to more than one object from coffee table, TV and sofa."
+            assert see_coffeetable + see_tv + see_sofa >= 3, "You don't see coffee table, TV and sofa."
+
+            if not close_to_coffeetable and not close_to_tv and not close_to_sofa:
+                object_text += "They are not close to you. "
+
+                if hold_chips and hold_milk:
+                    object_text += "Currently, you have grabbed the chips and the milk in hand. "
+                elif not hold_chips and hold_milk:
+                    object_text += "Currently, you have grabbed the milk in hand. "
+                elif hold_chips and not hold_milk:
+                    object_text += "Currently, you have grabbed the chips in hand. "
                 else:
-                    if len(overlay["in_agent"]) == 0:
-                        template = "Currently you don't have anything in hand."
-                        sentences.append(template.format(cutting_board_index[cindex]).capitalize())
+                    object_text += "Currently, you are not grabbing anything in hand. "
 
-                    elif len(overlay["in_agent"]) == 1:
-                        action_list[3] = "serve the dish"
-                        id = overlay["in_agent"][0]
-                        template = "Currently you are carrying {} in hand."
-                        if id == 1:
-                            sentences.append(template.format("a bowl").capitalize())
-                            action_list[0] = hold_bowl_action[0]
-                            action_list[2] = action_template.format(raw_ingredient[id])
+                action_list = [
+                    1,
+                    2,
+                    3,
+                    6,
+                    7,
+                    8
+                ]
+
+            if close_to_coffeetable:
+
+                if (chips_on_coffeetable and hold_milk) or (milk_on_coffeetable and hold_chips):
+                    object_text += "The TV is not close to you. "
+                else:
+                    object_text += "The coffee table is close to you. "
+
+                if hold_chips and hold_milk:
+                    object_text += "Currently, you have grabbed the chips and the milk in hand. "
+
+                    action_list = [
+                        1,
+                        2,
+                        3,
+                        7,
+                        8,
+                        11,
+                        12
+                    ]
+                elif not hold_chips and hold_milk:
+                    if not chips_on_coffeetable:
+                        object_text += "Currently, you have grabbed the milk in hand. "
+
+                        action_list = [
+                            1,
+                            2,
+                            3,
+                            7,
+                            8,
+                            12
+                        ]
+
+                    else:
+                        object_text += "Currently, you have the chips on the coffee table and the milk in your hand. "
+
+                        action_list = [
+                            1,
+                            2,
+                            3,
+                            7,
+                            8,
+                        ]
+
+                elif hold_chips and not hold_milk:
+                    object_text += "Currently, you have grabbed the chips in hand. "
+
+                    if not milk_on_coffeetable:
+                        object_text += "Currently, you have grabbed the chips in hand. "
+
+                        action_list = [
+                            1,
+                            2,
+                            3,
+                            7,
+                            8,
+                            11
+                        ]
+
+                    else:
+                        object_text += "Currently, you have the milk on the coffee table and the chips in your hand. "
+
+                        action_list = [
+                            1,
+                            2,
+                            3,
+                            7,
+                            8,
+                        ]
+
+                else:
+                    object_text += "Currently, you are not grabbing anything in hand. "
+
+                    action_list = [
+                        1,
+                        2,
+                        3,
+                    ]
+
+            if close_to_tv:
+                if is_tv_on:
+                    object_text += "The sofa is not close to you. "
+
+                    if hold_chips and hold_milk:
+                        object_text += "Currently, the TV is turned on, you have grabbed the chips and the milk in hand. "
+
+                    elif not hold_chips and hold_milk:
+                        if not chips_on_coffeetable:
+                            object_text += "Currently, the TV is turned on, you have grabbed the milk in hand. "
                         else:
-                            if chopped[id]:
-                                sentences.append(template.format("a chopped " + raw_ingredient[id], ).capitalize())
+                            object_text += "Currently, the TV is turned on, you have the chips on the coffee table and the milk in your hand. "
+                    elif hold_chips and not hold_milk:
+                        object_text += "Currently, the TV is turned on, you have grabbed the chips in hand. "
+                        if not milk_on_coffeetable:
+                            object_text += "Currently, the TV is turned on, you have grabbed the chips in hand. "
+                        else:
+                            object_text += "Currently, the TV is turned on, you have the milk on the coffee table and the chips in your hand. "
+
+                    action_list = [
+                        1,
+                        2,
+                        3,
+                        6,
+                        8,
+                    ]
+
+                else:
+                    object_text += "The TV is close to you. "
+
+                    if hold_chips and hold_milk:
+                        object_text += "Currently, you have grabbed the chips and the milk in hand. "
+
+                    elif not hold_chips and hold_milk:
+                        if not chips_on_coffeetable:
+                            object_text += "Currently, you have grabbed the milk in hand. "
+                        else:
+                            object_text += "Currently, you have the chips on the coffee table and the milk in your hand. "
+                    elif hold_chips and not hold_milk:
+                        object_text += "Currently, you have grabbed the chips in hand. "
+                        if not milk_on_coffeetable:
+                            object_text += "Currently, you have grabbed the chips in hand. "
+                        else:
+                            object_text += "Currently, you have the milk on the coffee table and the chips in your hand. "
+
+                    action_list = [
+                        1,
+                        2,
+                        3,
+                        6,
+                        8,
+                        13,
+                        14
+                    ]
+
+            if close_to_sofa:
+
+                if not is_sit_sofa:
+                    object_text += "The sofa is close to you. "
+
+                    if is_tv_on:
+                        if hold_chips and hold_milk:
+                            object_text += "Currently, the TV is turned on, you have grabbed the chips and the milk in hand. "
+
+                        elif not hold_chips and hold_milk:
+                            if not chips_on_coffeetable:
+                                object_text += "Currently, the TV is turned on, you have grabbed the milk in hand. "
                             else:
-                                sentences.append(template.format("an unchopped " + raw_ingredient[id]).capitalize())
-                                action_list[2] = action_template.format(raw_ingredient[id])
-                    elif len(overlay["in_agent"]) > 1:
-                        action_list[3] = "serve the dish"
-                        in_plate_item = overlay["in_agent"][:-1]
-                        if len(in_plate_item) == 1:
-                            full_plate_template = "Currently you are carrying a bowl containing chopped {}."
-                        elif len(in_plate_item) == 2:
-                            full_plate_template = "Currently you are carrying a bowl containing chopped {} and {}."
-                        elif len(in_plate_item) == 3:
-                            full_plate_template = "Currently you are carrying a bowl containing chopped {}, {} and {}."
-                        sentences.append(
-                            full_plate_template.format(*[raw_ingredient[id] for id in in_plate_item]).capitalize())
-                        action_list[0] = hold_bowl_action[0]
-                        action_list[2] = action_template.format("bowl")
+                                object_text += "Currently, the TV is turned on, you have the chips on the coffee table and the milk in your hand. "
+                        elif hold_chips and not hold_milk:
+                            object_text += "Currently, the TV is turned on, you have grabbed the chips in hand. "
+                            if not milk_on_coffeetable:
+                                object_text += "Currently, the TV is turned on, you have grabbed the chips in hand. "
+                            else:
+                                object_text += "Currently, the TV is turned on, you have the milk on the coffee table and the chips in your hand. "
 
-                sentences.append("To serve the dish of a bowl only containing chopped tomato, you should first")
+                        action_list = [
+                            1,
+                            2,
+                            3,
+                            6,
+                            7,
+                            15,
+                            16
+                        ]
+                    else:
+                        if hold_chips and hold_milk:
+                            object_text += "Currently, you have grabbed the chips and the milk in hand. "
 
-            return {"prompt": " ".join(sentences), "action": action_list}
+                        elif not hold_chips and hold_milk:
+                            if not chips_on_coffeetable:
+                                object_text += "Currently, you have grabbed the milk in hand. "
+                            else:
+                                object_text += "Currently, you have the chips on the coffee table and the milk in your hand. "
+                        elif hold_chips and not hold_milk:
+                            object_text += "Currently, you have grabbed the chips in hand. "
+                            if not milk_on_coffeetable:
+                                object_text += "Currently, you have grabbed the chips in hand. "
+                            else:
+                                object_text += "Currently, you have the milk on the coffee table and the chips in your hand. "
+
+                        action_list = [
+                            1,
+                            2,
+                            3,
+                            6,
+                            7,
+                        ]
+
+                else:
+                    object_text += "You are sitting on the sofa. "
+
+                    if is_tv_on:
+                        if hold_chips and hold_milk:
+                            object_text += "Currently, the TV is turned on, you have grabbed the chips and the milk in hand. "
+
+                        elif not hold_chips and hold_milk:
+                            if not chips_on_coffeetable:
+                                object_text += "Currently, the TV is turned on, you have grabbed the milk in hand. "
+                            else:
+                                object_text += "Currently, the TV is turned on, you have the chips on the coffee table and the milk in your hand. "
+                        elif hold_chips and not hold_milk:
+                            object_text += "Currently, the TV is turned on, you have grabbed the chips in hand. "
+                            if not milk_on_coffeetable:
+                                object_text += "Currently, the TV is turned on, you have grabbed the chips in hand. "
+                            else:
+                                object_text += "Currently, the TV is turned on, you have the milk on the coffee table and the chips in your hand. "
+
+                        action_list = [1, 2, 3]
+                    else:
+                        if hold_chips and hold_milk:
+                            object_text += "Currently, you have grabbed the chips and the milk in hand. "
+
+                        elif not hold_chips and hold_milk:
+                            if not chips_on_coffeetable:
+                                object_text += "Currently, you have grabbed the milk in hand. "
+                            else:
+                                object_text += "Currently, you have the chips on the coffee table and the milk in your hand. "
+                        elif hold_chips and not hold_milk:
+                            object_text += "Currently, you have grabbed the chips in hand. "
+                            if not milk_on_coffeetable:
+                                object_text += "Currently, you have grabbed the chips in hand. "
+                            else:
+                                object_text += "Currently, you have the milk on the coffee table and the chips in your hand. "
+
+                        action_list = [1, 2, 3]
+
+        elif in_bedroom:
+
+            if hold_chips and hold_milk:
+                object_text += "and notice nothing. Currently, you have grabbed the chips and the milk in hand. "
+            elif hold_chips and not hold_milk:
+                object_text += "and notice nothing. Currently, you have grabbed the chips in hand. "
+            elif not hold_chips and hold_milk:
+                object_text += "and notice nothing. Currently, you have grabbed the milk in hand. "
+            else:
+                object_text += "and notice nothing. Currently, you are not grabbing anything in hand. "
+
+            action_list = [0, 1, 2]
+
+        elif in_bathroom:
+
+            if hold_chips and hold_milk:
+                object_text += "and notice nothing. Currently, you have grabbed the chips and the milk in hand. "
+            elif hold_chips and not hold_milk:
+                object_text += "and notice nothing. Currently, you have grabbed the chips in hand. "
+            elif not hold_chips and hold_milk:
+                object_text += "and notice nothing. Currently, you have grabbed the milk in hand. "
+            else:
+                object_text += "and notice nothing. Currently, you are not grabbing anything in hand. "
+
+            action_list = [0, 1, 3]
+
+        text += object_text
+
+        # template for target
+        target_template = "In order to enjoy the chips and the milk while watching TV, "
+        text += target_template
+
+        # template for next step
+        next_step_text = "your next step is to"
+        text += next_step_text
+
+        self.action_template = [
+            "walk to the living room",  # 0
+            "walk to the kitchen",  # 1
+            "walk to the bathroom",  # 2
+            "walk to the bedroom",  # 3
+
+            "walk to the chips",  # 4
+            "walk to the milk",  # 5
+            'walk to the coffee table',  # 6
+            'walk to the TV',  # 7
+            'walk to the sofa',  # 8
+
+            "grab the chips",  # 9
+            "grab the milk",  # 10
+
+            'put the chips on the coffee table',  # 11
+            'put the milk on the coffee table',  # 12
+
+            "turn on the TV",  # 13
+            "turn off the TV",  # 14
+
+            "sit on the sofa",  # 15
+            "stand up from the sofa"  # 16
+        ]
+
+        self.template2action = {
+            k: i for i, k in enumerate(self.action_template)
+        }
+
+        actions = [self.action_template[i] for i in action_list]
+
+        return {"prompt": text, "action": actions}
+
