@@ -10,20 +10,16 @@ class Critic(nn.Module):
         super().__init__()
         self.config = base_model.config
         self.num_padding_at_beginning = num_padding_at_beginning
-        if hasattr(self.config, "word_embed_proj_dim"):
-            # `OPT` models use word_embed_proj_dim as final output
-            # https://github.com/huggingface/transformers/blob/main/src/transformers/models/opt/modeling_opt.py#L497
-            self.v_head = nn.Linear(self.config.word_embed_proj_dim,
-                                    1,
-                                    bias=False)
-        else:
-            # `gpt-neo(x)` models use `hidden_size` attribute names instead of `n_embd``
-            self.config.n_embd = self.config.hidden_size if hasattr(
-                self.config, "hidden_size") else self.config.n_embd
-            self.v_head_mlp1 = nn.Linear(self.config.n_embd, 1024, bias=False)
-            self.v_head_mlp2 = nn.Linear(1024, 512, bias=False)
-            self.v_head_mlp3 = nn.Linear(512, 1, bias=False)
-            self.relu = nn.ReLU()
+        # `OPT` models use word_embed_proj_dim as final output
+        # https://github.com/huggingface/transformers/blob/main/src/transformers/models/opt/modeling_opt.py#L497
+        # `gpt-neo(x)` models use `hidden_size` attribute names instead of `n_embd``
+        self.config.n_embd = self.config.hidden_size if hasattr(
+             self.config, "hidden_size") else self.config.word_embed_proj_dim if hasattr(
+             self.config, "word_embed_proj_dim") else self.config.n_embd
+        self.v_head_mlp1 = nn.Linear(self.config.n_embd, 1024, bias=False)
+        self.v_head_mlp2 = nn.Linear(1024, 512, bias=False)
+        self.v_head_mlp3 = nn.Linear(512, 1, bias=False)
+        self.relu = nn.ReLU()
         self.rwtranrsformer = base_model
         self.PAD_ID = tokenizer.pad_token_id
 
