@@ -249,6 +249,7 @@ class LLMAgent(nn.Module):
         else:
             return action, log_probs, entroy, None
 
+    # TODO: Rewrite this function to use our prompts
     def obs2text(self, obs):
 
         text = ""
